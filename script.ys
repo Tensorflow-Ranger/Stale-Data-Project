@@ -1,0 +1,42 @@
+# 1. Read the Verilog design. The `-formal` flag is required.
+#    Replace <your_verilog_file.v> with your source file.
+read_verilog -formal combined_with_ext.v
+
+# 2. Establish the top-level module and perform initial checks.
+#    Replace <top_module> with the name of your top-level module.
+hierarchy -check -top BoomTile
+
+# 3. Apply environmental assumptions early to simplify the design.
+chformal -assume -early
+
+# 4. Convert procedural blocks (always, initial) to a circuit netlist.
+proc;
+
+
+# 6. Flatten the design hierarchy into a single module.
+flatten
+
+# 7. Explicitly handle memories, preserving them as arrays for BTOR2.
+
+memory -nomap
+
+# 8. Perform a more thorough optimization pass.
+
+# 9. Handle black-boxed modules by creating unconstrained inputs at their outputs.
+cutpoint -blackbox
+
+# 10. Clean up the hierarchy, removing the now-unreferenced black-boxed modules.
+hierarchy -check
+
+# 11. NEW: Unmap complex flip-flops ($sdff) into simple ones ($dff) and logic.
+#     This is the crucial fix for the "Unsupported cell type" error.dffunmap
+dffunmap
+
+memory_nordff
+
+# 12. Perform a final cleanup of any trivial logic left over.
+opt_clean
+
+yosys miter -equiv Rocket Rocket miter_Rocket
+
+write_btor -x output.btor2
