@@ -1,57 +1,178 @@
-# Chipyard BootROM and Minimal Kernels
+# Stale Data Project
 
-Minimal baremetal BootROM and kernel examples written to run on Rocket Chip via Chipyard.
-These are intentionally small assembly-only examples for testing, learning, or using as a starting
-point for custom boot ROMs and tiny kernels.
+## Preprocessing Pipeline:
+1. Chisel elaboration
+2. FIRRTL transforms
+   - WithMemToRegs  
+3. Verilog emission
 
-Files
-- `cs_umode.S` : Performs context switching between two processes in U mode
-- `bootrom.S` : Minimal Boot ROM — a small assembly BootROM that sets up machine mode and
-  jumps to a kernel image or entry point. Use this as the primary minimal boot ROM.
-- `bootrom2.S` : Variant Boot ROM — alternate layout/initialization or experiment with a
-  different entry/addressing style.
-- `bootrom3.S` : Another Boot ROM variant — additional experimental/minimal variant.
-- `hard_kernel.S` : Minimal kernel marked "hard" — small example kernel that demonstrates
-  low-level baremetal behavior (e.g., simple loop, memory accesses, or MMIO hits).
-- `kernel2.S` : Alternate kernel example — another tiny kernel variant useful for testing
-  different startup sequences or peripheral access patterns.
-- `slack_kernel.S` : Slack/relaxed kernel example — small kernel used to exercise timing,
-  no-OS behavior, or alternate control flow.
+4. ext_definition_adder
+   - Generates *_ext stubs
+   - You manually fix missing ports (R0_en, etc.) 
+   - Add plusarg_reader blackbox               
+
+5. shallow blackboxing script
+   - Abstract internal modules
+
+6. Yosys → BTOR2
+   - No memories
+   - No missing modules
+
+7. BTOR2 cleaner
+   - Fix names
 
 
-Notes
-- These files are small, hand-written RISC-V assembly sources intended to be used inside
-  a Chipyard/ Rocket Chip boot flow as BootROM or kernel payloads.
-- Exact behavior differs per file — inspect the comments at the top of each `.S` file for
-  precise entry symbols, expected memory layout, and any included sample data.
 
-Building / Converting to a BootROM image (example)
-- Requirements: a RISC-V cross toolchain (GNU binutils / gcc for RISC-V), e.g.:
-  `riscv64-unknown-elf-gcc`, `riscv64-unknown-elf-objcopy`, `riscv64-unknown-elf-ld`.
-- Minimal example to assemble/link a single `.S` file into a binary then convert to a
-  simple hex/binary payload (adjust flags, linker script, and ISA as needed):
-
+# # Steps to build the pipeline:
+1) Add this to BoomConfig.scala
 ```bash
-# assemble & link (example, requires a suitable `linker.ld`)
-riscv64-unknown-elf-gcc -nostdlib -T linker.ld -march=rv64gc -mabi=lp64d \
-  -o kernel.elf bootrom.S
+import chisel3._
+import firrtl.options.Dependency
+import firrtl.passes.ReplaceMems
+import firrtl.stage.Forms
+import freechips.rocketchip.config.{Config, Field, Parameters}
 
-# convert to raw binary
-riscv64-unknown-elf-objcopy -O binary kernel.elf kernel.bin
+// This is the transform that will run the ReplaceMems pass.
+class MemToRegs extends firrtl.Transform {
+  override def invalidates(a: firrtl.Transform): Boolean = false
+  override def dependencies = Seq(Dependency(firrtl.passes.RemoveValidIf))
+  override def name = "Replace All Mems with Registers"
 
-# create a simple 32-bit little-endian hex list (useful for some BootROM generators)
-hexdump -v -e '1/4 "%08x\n"' kernel.bin > bootrom.hex
+  override def execute(state: firrtl.CircuitState): firrtl.CircuitState = {
+    val circuit = state.circuit
+    val result = (new ReplaceMems).run(circuit)
+    state.copy(circuit = result)
+  }
+}
+
+// This is a Config fragment that you can mix into your main Config.
+class WithMemToRegs extends Config((site, here, up) => {
+  case firrtl.stage.FirrtlCircuitAnnotation =>
+    Seq(firrtl.annotations.Annotation(
+      firrtl.CircuitTarget("Top"), // Apply to the whole design
+      classOf[MemToRegs],
+      ""
+    ))
+})
+
+class SmallBoomV4Config extends Config(
+  new WithMemToRegs ++ // <--- Add this line
+  new boom.v4.common.WithSmallBooms ++
+  new chipyard.config.AbstractConfig
+)
 ```
 
-- How you include `bootrom.hex` into Chipyard depends on your Chipyard configuration and
-  the BootROM packaging you use (Verilator emulation, FPGA image, or a boot ROM generator
-  inside your SoC generator). Common patterns:
-  - Provide `bootrom.hex` to the BootROM generator used by your Chipyard build.
-  - Embed the binary into a ROM section in the system-level memory map.
+2) Build SmallBoom in chipyard
 
-Tips
-- Inspect each `.S` for the defined entry symbol (commonly `_start` or `entry`) and
-  any linker script expectations. If you change the link address, update the linker
-  script accordingly.
-- If you want UART output for debugging, confirm the kernel's MMIO addresses match your
-  Rocket Chip MMIO map and that the UART is enabled in your Chipyard configuration.
+3) Use SV2V to get a combined verilog file for the entire SmallBoom Build
+
+4) Run ext_definition_adder.py to add in missing definitions that verilator would typically fill in during simulation
+
+6) Add R0_en in meta_0_ext and ghist_0_ext, rob_compact_uop_mem_0_ext
+
+7) Add definition for plusarg_reader 
+```bash
+module plusarg_reader #(
+    parameter DEFAULT = 0,
+    parameter FORMAT = "",
+    parameter WIDTH = 32
+) (
+    output [WIDTH-1:0] out
+);
+// blackbox: no implementation
+endmodule
+```
+
+8) Use verilog-blackboxing.py to perform shallow blackboxing. 
+
+9) Run script.ys using Yosys to get a .btor2 file
+
+10) Use btor2-cleaner.py to provide names to each state in the btor2 and clean it up. 
+
+---
+
+## What problem each script solves
+
+### `ext_definition_adder.py`
+
+When building **SmallBoom**, the generated Verilog often contains instantiations of modules that do **not** have corresponding definitions in the file, typically named like:
+
+```verilog
+Something_ext
+```
+
+This causes downstream tools to fail with errors such as:
+
+```
+Module 'X_ext' not found
+```
+
+However, the logic of these modules is **not required**—only their interfaces are.
+
+**What this script does:**
+
+* Detects instantiated but undefined `_ext` modules
+* Infers their interfaces from how they are connected
+* Auto-generates **minimal blackbox module definitions** with:
+
+  * Correct port names
+  * Correct directions
+  * Correct bit-widths
+
+This makes the Verilog **structurally complete** without adding unnecessary logic.
+
+---
+
+### `verilog-blackboxing.py`
+
+A Verilog design forms a **module dependency graph**:
+
+* Modules instantiate other modules
+* This creates a hierarchy (tree/graph)
+
+This script lets you define a **verification boundary**, typically `BoomTile`.
+
+**Goal:**
+
+> Blackbox most logic *inside* `BoomTile`, while keeping a small set of important modules (e.g., `LSU`) fully visible. Everything outside `BoomTile` remains untouched.
+
+**Conceptually:**
+
+* Outside the boundary → **left intact**
+* Inside the boundary → **blackboxed by default**
+* Explicit exceptions → **kept as whiteboxes (along with their children)**
+
+**What this script does:**
+
+* Builds a dependency graph from the Verilog
+* Identifies all modules inside `BoomTile`
+* Adds `(* blackbox *)` annotations selectively
+* Enables **shallow blackboxing** for scalable formal verification
+
+---
+
+### `btor2-cleaner.py`
+
+BTOR2 files generated by tools often contain messy or inconsistent signal naming:
+
+* Names may appear inline, in comments, or both
+* Tool-generated junk names (containing `$`)
+* Names split across multiple lines
+* Decorative comments (`; begin`, `; end`, filenames)
+
+These issues make debugging and formal analysis harder.
+
+**What this script does:**
+
+* Normalizes BTOR2 signal names
+* Ensures **at most one clean, valid name per command**
+* Applies deterministic name precedence:
+
+  * Comment name (highest priority)
+  * Inline name (fallback)
+  * No name if both are invalid
+* Removes decorative and junk comments
+
+The result is a **clean, readable, tool-friendly BTOR2 file**.
+
+
